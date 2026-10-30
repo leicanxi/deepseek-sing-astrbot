@@ -20,7 +20,7 @@ QQ ──► AstrBot（默认） ──► 本插件 ──HTTP──► sing-so
 - `/点歌 歌名 [音色名]` —— 网易云曲库搜歌 + AI 翻唱，直接发语音（VIP 歌曲自动解锁：完整曲目或约 45 秒试听段）
 - `/音色` —— 获取音色广场链接，在广场挑好音色名后点歌时带上即可。
 - 指定音色 —— 在插件配置「演唱默认参数 → 音色」里填一次，点歌就不用每次指定音色
-- LLM 工具调用 —— 直接对机器人说「唱一首《歌名》」即可
+- LLM 工具调用 —— 直接对机器人说「唱一首《歌名》」即可；音频前会标明唱的是哪个版本（歌名 — 歌手），说一句「不对，换一版」就会拿候选列表让你重选
 - 用量限制（可选）—— 给群友设每人 / 每群 / 全机器人的 24 小时点歌次数上限与连点间隔，防止被刷；默认不限
 - 两种模式一键切换：FlowBee 免部署按次计费 / 自托管网关用你自己的 Replicate Token
 - 音色自定义: Flowbee模式音色可联系我为你添加；自托管模式支持在插件配置页直接编辑音色白名单 JSON，改完即时生效
@@ -161,6 +161,7 @@ Replicate 是一家美国的开源 AI 模型托管云平台，面向开发者，
 | 演唱默认参数 | 截取起点（秒）   | `60`                        | 从歌曲第几秒开始截取                                        |
 | 演唱默认参数 | 音高（半音）     | `2`                         | 整体升降调                                                  |
 | 演唱默认参数 | 人声音域         | `no-change`                 | 下拉选择：`no-change` / `male-to-female` / `female-to-male` |
+| 演唱默认参数 | 生成方式         | `auto`                      | `auto` 优先异步任务、旧网关自动回退同步；`job` 只用任务接口；`sync` 只用同步接口 |
 | 使用限制     | 每人每 24 小时次数 | `-1`（不限）              | 一个人最多点几首；私聊与群内分别计算                        |
 | 使用限制     | 每群每 24 小时次数 | `-1`（不限）              | 整群成员共享的额度                                          |
 | 使用限制     | 同一人点歌间隔（秒） | `-1`（不限）            | 防止连点刷屏                                                |
@@ -182,7 +183,7 @@ Replicate 是一家美国的开源 AI 模型托管云平台，面向开发者，
 
 ## 计费说明
 
-- **FlowBee 模式**：每次生成按 FlowBee 上 `sing-song` 模型的定价扣费（以 [FlowBee](https://flowbee.top) 页面标价为准），生成失败（网关报错）不扣费。
+- **FlowBee 模式**：每次生成按 FlowBee 上 `sing-song` 模型的定价扣费（以 [FlowBee](https://flowbee.top) 页面标价为准），生成失败（网关报错）不扣费。新版 FlowBee 支持按秒计费：走任务接口（`transport=auto/job`）时按实际生成秒数结算，缓存命中可按平台配置打折或免费；旧版仍按次计费。
 - **self-hosted 模式**：只花你自己 Replicate 账户的钱，单次真实成本典型 $0.016–0.054（约 0.12–0.39 元），最坏情况（冷启动）约 $0.08（约 0.58 元）。
 
 ### 缓存是怎么回事？
@@ -194,9 +195,9 @@ Replicate 是一家美国的开源 AI 模型托管云平台，面向开发者，
 
 两点需要知悉：
 
-- **FlowBee 模式下**：new-api 按调用次数计费，感知不到网关内部是否命中缓存（平台计费机制所致）且平台visa支付会有汇损，服务器还需存储成本。后续如果flowbee使用人数增多，flowbee会按照实际情况调整价格，不留盈利空间。
+- **FlowBee 模式下**：新版网关 + 新版 new-api 走任务接口时按**实际生成秒数**计费，缓存命中是否打折由平台定价表达式决定；旧版网关/镜像仍按次计费，且感知不到缓存命中（平台计费机制所致）。平台 visa 支付会有汇损，服务器还有存储成本，后续会按实际情况调整价格。
 - **冷启动耗时**：网关空闲较久后的第一次生成需要加载模型容器，可能需要 2~4 分钟，之后的生成约 1 分钟；单次真实成本也以此时最高（约 0.58 元）。
-- **长任务与超时**：`/点歌` 和 LLM 工具都会先把任务放到后台执行并立即回复，生成完成后主动推送音频，因此不再受 AstrBot `tool_call_timeout`（默认 60/120 秒）限制。若你自建 new-api 中转，请把 `RELAY_TIMEOUT` 调到 **900 秒**以上（默认有的部署是 300 秒），否则网关还没生成完就会被中转层掐断。
+- **长任务与超时**：`/点歌` 和 LLM 工具都会先受理再后台执行，生成完成后主动推送音频，因此不受 AstrBot `tool_call_timeout`（默认 60/120 秒）限制。走任务接口（`transport=auto/job`）时提交和轮询都是秒级请求；只有走同步接口（`transport=sync` 或旧网关）才需要把自建 new-api 的 `RELAY_TIMEOUT` 调到 **900 秒**以上。
 
 ## 音色来源与免责声明
 
@@ -207,9 +208,10 @@ Replicate 是一家美国的开源 AI 模型托管云平台，面向开发者，
 
 ## 协议（网关接口简述）
 
-插件与网关之间是 OpenAI 兼容协议：
+插件与网关之间支持同步和异步两种协议（`transport=auto` 默认优先后者）：
 
-- 生成：`POST {base}/chat/completions`，`model=sing-song`，user content 为 JSON：`{"song": "歌名", "voice": "音色名", "start": 60, "duration": 25, "pitch": 2, "pitch_mode": "no-change"}`（`song` 可换成 `url` 直传歌曲链接，支持网易云 / B 站）。返回的 assistant content 是 JSON 音频块 `{"type": "audio", "source": {"url": "..."}}`。
+- 同步生成：`POST {base}/chat/completions`，`model=sing-song`，user content 为 JSON：`{"song": "歌名", "voice": "音色名", "start": 60, "duration": 25, "pitch": 2, "pitch_mode": "no-change"}`（`song` 可换成 `url` 直传歌曲链接，支持网易云 / B 站）。返回的 assistant content 是 JSON 音频块 `{"type": "audio", "source": {"url": "..."}, "duration_seconds": 60, "cached": false}`。
+- 异步任务：`POST {root}/sing/v1/jobs`（root 为去掉 `/v1` 的 base）带 `model=sing-song` 和同一份参数，立即返回 `{"id": "job_...", "status": "queued"}`；轮询 `GET {root}/sing/v1/jobs/{id}`，完成后返回 `audio_url`、`title`、`artist`、`duration_seconds`、`cached`。失败带 `error`。相同参数的重复提交会复用同一个任务。
 - 音色：接口不再返回音色列表（音色名不公开枚举，自定义音色靠名字保密）。`GET {base}/voices` 和 `model=sing-voices` 现在返回广场引导块 `{"type": "guide", "plaza_url": "https://voice-models.flowbee.top", ...}`，音色请到[音色广场](https://voice-models.flowbee.top)浏览。传不存在的音色名会得到 400 `unknown voice`，不枚举可用名字。
 
 ## 与类似项目的关系、致谢

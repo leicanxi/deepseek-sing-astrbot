@@ -93,6 +93,13 @@
         "default": "no-change",
         "options": ["no-change", "male-to-female", "female-to-male"],
         "hint": "默认 no-change。"
+      },
+      "transport": {
+        "description": "生成方式",
+        "type": "string",
+        "default": "auto",
+        "options": ["auto", "job", "sync"],
+        "hint": "auto：优先走异步任务接口，旧网关不支持时自动回退同步；job：只用任务接口（支持按秒计费和缓存计费）；sync：只用同步接口。"
       }
     }
   },

@@ -29,6 +29,7 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.components import File, Record
 
 SING_MODEL = "sing-song"
+SEARCH_MODEL = "sing-search"
 # Cold starts can take 2-4 minutes; the upstream relay itself allows ~15 minutes.
 REQUEST_TIMEOUT = 960.0
 PITCH_MODES = ("no-change", "male-to-female", "female-to-male")
@@ -40,6 +41,11 @@ PLUGIN_NAME = "astrbot_plugin_deepseek_sing"
 # instead of resetting at midnight.
 LIMIT_WINDOW_SECONDS = 24 * 3600
 _RESERVED_EXTRA = "deepseek_sing_quota_reserved"
+JOB_POLL_INTERVAL = 3.0
+
+
+class _JobUnavailable(RuntimeError):
+    """The endpoint has no job API (old gateway, or new-api without the plugin)."""
 
 # Config keys grouped into cards in _conf_schema.json (nested dicts since v0.2.0).
 _CONFIG_GROUPS = {
@@ -54,6 +60,7 @@ _CONFIG_GROUPS = {
     "start": "singing",
     "pitch": "singing",
     "pitch_mode": "singing",
+    "transport": "singing",
     "daily_per_user": "limits",
     "daily_per_group": "limits",
     "cooldown_seconds": "limits",
@@ -270,6 +277,20 @@ class DeepSeekSingPlugin(Star):
         return str(self._get(key) or "").strip().rstrip("/")
 
     @property
+    def transport(self) -> str:
+        """``auto`` prefers the job API, ``job`` requires it, ``sync`` never uses it."""
+        mode = str(self._get("transport") or "auto").strip().lower()
+        return mode if mode in {"auto", "job", "sync"} else "auto"
+
+    @property
+    def api_root(self) -> str:
+        """Base URL without the OpenAI ``/v1`` suffix, for job routes."""
+        base = self.base_url
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        return base.rstrip("/")
+
+    @property
     def api_key(self) -> str:
         key = "gateway_token" if self.mode == "self-hosted" else "flowbee_api_key"
         return str(self._get(key) or "").strip()
@@ -415,7 +436,7 @@ class DeepSeekSingPlugin(Star):
 
     # ---- generation ---------------------------------------------------------
 
-    async def _sing(self, song: str, voice: str = "") -> dict[str, Any]:
+    def _job_payload(self, song: str, voice: str) -> dict[str, Any]:
         payload: dict[str, Any] = dict(self._gen_params())
         if song.startswith(("http://", "https://")):
             payload["url"] = song
@@ -424,11 +445,105 @@ class DeepSeekSingPlugin(Star):
         voice = (voice or "").strip() or self.default_voice
         if voice:
             payload["voice"] = voice
-        block = await self._chat(SING_MODEL, payload)
+        return payload
+
+    async def _sing_sync(self, song: str, voice: str = "") -> dict[str, Any]:
+        block = await self._chat(SING_MODEL, self._job_payload(song, voice))
         source = block.get("source")
         if block.get("type") != "audio" or not isinstance(source, dict) or not source.get("url"):
             raise RuntimeError(str(block.get("error") or "网关没有返回音频"))
         return block
+
+    async def _sing_job(self, song: str, voice: str = "") -> dict[str, Any]:
+        payload = self._job_payload(song, voice)
+        request = {"model": SING_MODEL, **payload}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            job = await self._submit_job(client, request)
+            data = await self._poll_job(client, str(job["id"]), job)
+        block = self._job_block(data)
+        if not block["source"]["url"]:
+            raise RuntimeError(str(data.get("error") or "网关没有返回音频"))
+        return block
+
+    async def _submit_job(
+        self, client: httpx.AsyncClient, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = await client.post(
+            f"{self.api_root}/sing/v1/jobs",
+            headers={"Authorization": f"Bearer {self._require_key()}"},
+            json=request,
+        )
+        if response.status_code in (404, 405, 501):
+            raise _JobUnavailable(f"HTTP {response.status_code}")
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"网关请求失败：HTTP {response.status_code} {self._error_detail(response)}"
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("网关返回格式不正确") from exc
+        job_id = str(data.get("id") or "").strip() if isinstance(data, dict) else ""
+        if not job_id:
+            raise RuntimeError("网关没有返回任务 ID")
+        return {**data, "id": job_id}
+
+    async def _poll_job(
+        self, client: httpx.AsyncClient, job_id: str, first: dict[str, Any]
+    ) -> dict[str, Any]:
+        status = str(first.get("status") or "")
+        if status == "succeeded":
+            return first
+        if status == "failed":
+            raise RuntimeError(str(first.get("error") or "生成失败"))
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        while time.monotonic() < deadline:
+            await asyncio.sleep(JOB_POLL_INTERVAL)
+            response = await client.get(
+                f"{self.api_root}/sing/v1/jobs/{job_id}",
+                headers={"Authorization": f"Bearer {self._require_key()}"},
+            )
+            if response.status_code == 404:
+                raise RuntimeError("任务不存在或已过期")
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"查询任务失败：HTTP {response.status_code} {self._error_detail(response)}"
+                )
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise RuntimeError("网关返回格式不正确") from exc
+            status = str(data.get("status") or "") if isinstance(data, dict) else ""
+            if status == "succeeded":
+                return data
+            if status == "failed":
+                raise RuntimeError(str(data.get("error") or "生成失败"))
+        raise TimeoutError(f"任务 {job_id} 在 {int(REQUEST_TIMEOUT)} 秒内没有完成")
+
+    @staticmethod
+    def _job_block(data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "type": "audio",
+            "source": {"type": "url", "url": str(data.get("audio_url") or "")},
+            "media_type": "audio/mpeg",
+            "filename": str(data.get("filename") or ""),
+            "title": str(data.get("title") or ""),
+            "artist": str(data.get("artist") or ""),
+            "duration_seconds": int(data.get("duration_seconds") or 0),
+            "cached": bool(data.get("cached")),
+        }
+
+    async def _generate(self, song: str, voice: str = "") -> dict[str, Any]:
+        mode = self.transport
+        if mode == "sync":
+            return await self._sing_sync(song, voice)
+        try:
+            return await self._sing_job(song, voice)
+        except _JobUnavailable as exc:
+            if mode == "job":
+                raise RuntimeError("网关没有提供任务接口，请升级网关或把 transport 改成 auto/sync") from exc
+            logger.info("[deepseek-sing] 任务接口不可用，回退同步：%s", exc)
+            return await self._sing_sync(song, voice)
 
     async def _download_audio(self, url: str) -> Path:
         path = Path(tempfile.gettempdir()) / f"deepseek_sing_{uuid.uuid4().hex}.mp3"
@@ -497,11 +612,11 @@ class DeepSeekSingPlugin(Star):
     ) -> None:
         try:
             try:
-                block = await self._sing(song, voice)
+                block = await self._generate(song, voice)
             except Exception as exc:
                 if not voice or "unknown voice" not in str(exc):
                     raise
-                block = await self._sing(fallback_song, "")
+                block = await self._generate(fallback_song, "")
         except Exception as exc:
             logger.warning(
                 "[deepseek-sing] 点歌失败：%s: %r",
@@ -512,6 +627,13 @@ class DeepSeekSingPlugin(Star):
             await self._refund_limits(event)
             await self._send_text(event, f"❌ 点歌失败：{_describe_error(exc)}")
             return
+        title = str(block.get("title") or "").strip()
+        artist = str(block.get("artist") or "").strip()
+        if title:
+            # Label the version before the audio: that is what lets the user tell
+            # a wrong pick without listening all the way through.
+            label = f"🎤 《{title}》" + (f" — {artist}" if artist else "")
+            await self._send_text(event, f"{label}\n不对就说一声，可以换一版。")
         await self._send_audio(event, str(block["source"]["url"]))
 
     async def _send_text(self, event: AstrMessageEvent, text: str) -> None:
@@ -588,6 +710,9 @@ class DeepSeekSingPlugin(Star):
     async def sing_song_tool(self, event: AstrMessageEvent, song: str, voice: str = "") -> str:
         '''唱一首歌（AI 翻唱），会直接把音频发到当前会话。
 
+        音频前会标明唱的是哪个版本；如果用户听完说不是这首，用 confirm_song
+        拿到候选让他重选。
+
         Args:
             song(string): 歌曲名；用户明确确认过的 B 站歌曲链接也可以直接传。
             voice(string, optional): 音色名（用户在音色广场挑好的名字），可先调用 list_sing_voices 获取广场链接。
@@ -605,6 +730,45 @@ class DeepSeekSingPlugin(Star):
         # (tool_call_timeout, 60-120s by default). The audio is pushed when ready.
         self._start_generation(event, song, (voice or "").strip())
         return "已提交生成，完成后会直接把音频发到当前会话，请稍候。"
+
+    @filter.llm_tool(name="confirm_song")
+    async def confirm_song_tool(self, event: AstrMessageEvent, song: str, limit: int = 3) -> str:
+        '''重新确认要点的是哪首歌：返回网关按匹配度排好序的候选列表（免费，不生成音频）。
+
+        第 1 条就是网关的推荐，先看它；不要自己按标题重排或挑版本——标题上的
+        「深情版 / 女声版 / 原唱」这类装饰很容易误判。只有用户觉得唱的不是这首、
+        需要重新确认歌曲时才调用本工具；正常点歌直接 sing_song，不要预先调用，
+        一次点歌最多确认一次。
+
+        Args:
+            song(string): 用户说的歌名。
+            limit(int, optional): 候选数量，默认 3。
+        Returns:
+            候选列表（含 title/artist/duration/url）；用户选定后把那条的 url 传给 sing_song。
+        '''
+        query = (song or "").strip()
+        if not query:
+            return "请先告诉我要确认哪首歌（歌名）。"
+        try:
+            block = await self._chat(
+                SEARCH_MODEL, {"query": query, "limit": _clamp_int(limit, 3, 1, 5)}
+            )
+        except Exception as exc:
+            logger.warning("[deepseek-sing] confirm_song 失败：%r", exc, exc_info=True)
+            return f"没拿到候选：{_describe_error(exc)}"
+        candidates = block.get("data") or []
+        if not candidates:
+            return f"没搜到《{query}》的候选，换个歌名再试。"
+        return json.dumps(
+            {
+                "candidates": candidates,
+                "next": (
+                    "第 1 条是网关排序后的推荐，先把它报给用户确认；用户选了哪条，"
+                    "就把那条的 url 传给 sing_song。不要自己按标题挑版本。"
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     @filter.llm_tool(name="list_sing_voices")
     async def list_voices_tool(self, event: AstrMessageEvent) -> str:
