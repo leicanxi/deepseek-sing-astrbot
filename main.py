@@ -305,9 +305,9 @@ class DeepSeekSingPlugin(Star):
 
     def _gen_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {
-            "duration": _clamp_int(self._get("duration"), 25, 5, 60),
+            "duration": _clamp_int(self._get("duration"), 25, 5, 120),
             "start": _clamp_int(self._get("start"), 60, 0, 3600),
-            "pitch": _clamp_int(self._get("pitch"), 2, -24, 24),
+            "pitch": _clamp_int(self._get("pitch"), 0, -24, 24),
         }
         pitch_mode = str(self._get("pitch_mode") or "no-change").strip()
         if pitch_mode in PITCH_MODES:

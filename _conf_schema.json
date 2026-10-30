@@ -73,7 +73,7 @@
         "description": "片段长度（秒）",
         "type": "int",
         "default": 25,
-        "hint": "默认 25，范围 5~60。"
+        "hint": "默认 25，范围 5~120。"
       },
       "start": {
         "description": "截取起点（秒）",
@@ -84,8 +84,8 @@
       "pitch": {
         "description": "音高（半音）",
         "type": "int",
-        "default": 2,
-        "hint": "整体升降调，默认 2。"
+        "default": 0,
+        "hint": "整体升降调，默认 0（不升降）。"
       },
       "pitch_mode": {
         "description": "人声音域",
