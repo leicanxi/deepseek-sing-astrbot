@@ -94,6 +94,18 @@
         "options": ["no-change", "male-to-female", "female-to-male"],
         "hint": "默认 no-change。"
       },
+      "instrumental_volume": {
+        "description": "伴奏音量（dB）",
+        "type": "int",
+        "default": -60,
+        "hint": "-60 静音（默认纯人声），0 带原始音量伴奏，中间值更轻。点歌时在末尾加「伴奏」或「伴奏-6」可按次开启。"
+      },
+      "backup_vocals_volume": {
+        "description": "和声音量（dB）",
+        "type": "int",
+        "default": -60,
+        "hint": "-60 静音（默认无和声），0 带原始音量和声；和声也会被转成所选音色。对 AI 说「加和声」按次开启。"
+      },
       "transport": {
         "description": "生成方式",
         "type": "string",

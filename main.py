@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import tempfile
 import time
 import uuid
@@ -33,6 +34,12 @@ SEARCH_MODEL = "sing-search"
 # Cold starts can take 2-4 minutes; the upstream relay itself allows ~15 minutes.
 REQUEST_TIMEOUT = 960.0
 PITCH_MODES = ("no-change", "male-to-female", "female-to-male")
+# Mixing gains in dB: 0 keeps a stem (accompaniment / backing harmonies), -60
+# mutes it. The gateway clamps to the same range.
+VOLUME_MIN = -60
+VOLUME_MAX = 0
+# Trailing "/点歌 ... 伴奏[-dB]" token that turns the accompaniment on.
+_MIX_TOKEN_RE = re.compile(r"\s+((?:带)?伴奏(-?\d+)?)\s*$")
 FLOWBEE_KEY_URL = "https://flowbee.top"
 PLAZA_URL = "https://voice-models.flowbee.top"
 PLUGIN_NAME = "astrbot_plugin_deepseek_sing"
@@ -60,6 +67,8 @@ _CONFIG_GROUPS = {
     "start": "singing",
     "pitch": "singing",
     "pitch_mode": "singing",
+    "instrumental_volume": "singing",
+    "backup_vocals_volume": "singing",
     "transport": "singing",
     "daily_per_user": "limits",
     "daily_per_group": "limits",
@@ -68,7 +77,7 @@ _CONFIG_GROUPS = {
 }
 
 USAGE_HINT = (
-    "用法：/点歌 歌名 [音色名]　·　/音色 音色广场　·　/点歌帮助\n"
+    "用法：/点歌 歌名 [音色名] [伴奏[-dB]]　·　/音色 音色广场　·　/点歌帮助\n"
     "音色名可省略：未指定时使用插件配置的默认音色，未配置则用网关默认。"
 )
 
@@ -308,6 +317,12 @@ class DeepSeekSingPlugin(Star):
             "duration": _clamp_int(self._get("duration"), 25, 5, 120),
             "start": _clamp_int(self._get("start"), 60, 0, 3600),
             "pitch": _clamp_int(self._get("pitch"), 0, -24, 24),
+            "instrumental_volume": _clamp_int(
+                self._get("instrumental_volume"), VOLUME_MIN, VOLUME_MIN, VOLUME_MAX
+            ),
+            "backup_vocals_volume": _clamp_int(
+                self._get("backup_vocals_volume"), VOLUME_MIN, VOLUME_MIN, VOLUME_MAX
+            ),
         }
         pitch_mode = str(self._get("pitch_mode") or "no-change").strip()
         if pitch_mode in PITCH_MODES:
@@ -436,8 +451,12 @@ class DeepSeekSingPlugin(Star):
 
     # ---- generation ---------------------------------------------------------
 
-    def _job_payload(self, song: str, voice: str) -> dict[str, Any]:
+    def _job_payload(
+        self, song: str, voice: str, mix: dict[str, int] | None = None
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = dict(self._gen_params())
+        # Per-request gains (tool args, /点歌 伴奏 token) override the defaults.
+        payload.update(mix or {})
         if song.startswith(("http://", "https://")):
             payload["url"] = song
         else:
@@ -447,15 +466,19 @@ class DeepSeekSingPlugin(Star):
             payload["voice"] = voice
         return payload
 
-    async def _sing_sync(self, song: str, voice: str = "") -> dict[str, Any]:
-        block = await self._chat(SING_MODEL, self._job_payload(song, voice))
+    async def _sing_sync(
+        self, song: str, voice: str = "", mix: dict[str, int] | None = None
+    ) -> dict[str, Any]:
+        block = await self._chat(SING_MODEL, self._job_payload(song, voice, mix))
         source = block.get("source")
         if block.get("type") != "audio" or not isinstance(source, dict) or not source.get("url"):
             raise RuntimeError(str(block.get("error") or "网关没有返回音频"))
         return block
 
-    async def _sing_job(self, song: str, voice: str = "") -> dict[str, Any]:
-        payload = self._job_payload(song, voice)
+    async def _sing_job(
+        self, song: str, voice: str = "", mix: dict[str, int] | None = None
+    ) -> dict[str, Any]:
+        payload = self._job_payload(song, voice, mix)
         request = {"model": SING_MODEL, **payload}
         async with httpx.AsyncClient(timeout=30.0) as client:
             job = await self._submit_job(client, request)
@@ -533,17 +556,19 @@ class DeepSeekSingPlugin(Star):
             "cached": bool(data.get("cached")),
         }
 
-    async def _generate(self, song: str, voice: str = "") -> dict[str, Any]:
+    async def _generate(
+        self, song: str, voice: str = "", mix: dict[str, int] | None = None
+    ) -> dict[str, Any]:
         mode = self.transport
         if mode == "sync":
-            return await self._sing_sync(song, voice)
+            return await self._sing_sync(song, voice, mix)
         try:
-            return await self._sing_job(song, voice)
+            return await self._sing_job(song, voice, mix)
         except _JobUnavailable as exc:
             if mode == "job":
                 raise RuntimeError("网关没有提供任务接口，请升级网关或把 transport 改成 auto/sync") from exc
             logger.info("[deepseek-sing] 任务接口不可用，回退同步：%s", exc)
-            return await self._sing_sync(song, voice)
+            return await self._sing_sync(song, voice, mix)
 
     async def _download_audio(self, url: str) -> Path:
         path = Path(tempfile.gettempdir()) / f"deepseek_sing_{uuid.uuid4().hex}.mp3"
@@ -588,6 +613,7 @@ class DeepSeekSingPlugin(Star):
         song: str,
         voice: str,
         *,
+        mix: dict[str, int] | None = None,
         fallback_song: str | None = None,
     ) -> None:
         """Run one generation in the background so no tool/command timeout applies."""
@@ -596,6 +622,7 @@ class DeepSeekSingPlugin(Star):
                 event,
                 song,
                 voice,
+                mix=mix,
                 fallback_song=song if fallback_song is None else fallback_song,
             )
         )
@@ -608,15 +635,16 @@ class DeepSeekSingPlugin(Star):
         song: str,
         voice: str,
         *,
+        mix: dict[str, int] | None = None,
         fallback_song: str,
     ) -> None:
         try:
             try:
-                block = await self._generate(song, voice)
+                block = await self._generate(song, voice, mix)
             except Exception as exc:
                 if not voice or "unknown voice" not in str(exc):
                     raise
-                block = await self._generate(fallback_song, "")
+                block = await self._generate(fallback_song, "", mix)
         except Exception as exc:
             logger.warning(
                 "[deepseek-sing] 点歌失败：%s: %r",
@@ -653,9 +681,18 @@ class DeepSeekSingPlugin(Star):
             return
         self._sync_voices_file()
         # 音色名不再可枚举，由网关校验：末尾词先按音色尝试，网关报 unknown voice
-        # 时回退为整串歌名重新搜索。
-        song, voice = args, ""
-        parts = args.rsplit(maxsplit=1)
+        # 时回退为整串歌名重新搜索。结尾的「伴奏[-dB]」token 先消费掉，表示
+        # 本次带伴奏（0 原始音量，-6 轻一些）。
+        text = args
+        mix: dict[str, int] = {}
+        trailing = _MIX_TOKEN_RE.search(text)
+        if trailing:
+            mix["instrumental_volume"] = _clamp_int(
+                trailing.group(2) or 0, 0, VOLUME_MIN, VOLUME_MAX
+            )
+            text = text[: trailing.start()].strip()
+        song, voice = text, ""
+        parts = text.rsplit(maxsplit=1)
         if len(parts) == 2:
             song, voice = parts[0].strip(), parts[1].strip().casefold()
         refusal = await self._enforce_limits(event)
@@ -663,7 +700,7 @@ class DeepSeekSingPlugin(Star):
             await event.send(event.plain_result(refusal))
             return
         await event.send(event.plain_result("🎤 正在生成，请稍候（冷启动最长约 4 分钟）..."))
-        self._start_generation(event, song, voice, fallback_song=args)
+        self._start_generation(event, song, voice, mix=mix, fallback_song=text)
 
     @filter.command("音色")
     async def list_voices(self, event: AstrMessageEvent):
@@ -697,8 +734,9 @@ class DeepSeekSingPlugin(Star):
             event.plain_result(
                 "🎤 DeepSeek 唱歌\n"
                 "/点歌 歌名 [音色名]　AI 唱歌（音色名可省略）\n"
+                "/点歌 歌名 伴奏[-dB]　带伴奏翻唱，如 /点歌 晴天 伴奏、/点歌 晴天 伴奏-6（伴奏轻 6 dB）\n"
                 "/音色　音色广场链接\n\n"
-                "音色省略时使用插件配置的默认音色，未配置则用网关默认；自有音色可登录音色广场后在「上传音色」页自助提交（自动审核），详见 /音色。\n"
+                "要和声可对 AI 说「加和声」；音色省略时使用插件配置的默认音色，未配置则用网关默认；自有音色可登录音色广场后在「上传音色」页自助提交（自动审核），详见 /音色。\n"
                 "也可以直接对 LLM 说「唱一首《歌名》」，LLM 会自动调用工具。\n"
                 "生成按次计费或由你的 Replicate Token 承担，详见插件 README。"
             )
@@ -706,8 +744,32 @@ class DeepSeekSingPlugin(Star):
 
     # ---- LLM tool -----------------------------------------------------------
 
+    @staticmethod
+    def _mix_from_tool(instrumental_volume: Any, backup_vocals_volume: Any) -> dict[str, int]:
+        """Collect tool-provided mixing gains; absent or invalid values are omitted."""
+        mix: dict[str, int] = {}
+        for key, value in (
+            ("instrumental_volume", instrumental_volume),
+            ("backup_vocals_volume", backup_vocals_volume),
+        ):
+            if value is None:
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            mix[key] = max(VOLUME_MIN, min(VOLUME_MAX, parsed))
+        return mix
+
     @filter.llm_tool(name="sing_song")
-    async def sing_song_tool(self, event: AstrMessageEvent, song: str, voice: str = "") -> str:
+    async def sing_song_tool(
+        self,
+        event: AstrMessageEvent,
+        song: str,
+        voice: str = "",
+        instrumental_volume: int | None = None,
+        backup_vocals_volume: int | None = None,
+    ) -> str:
         '''唱一首歌（AI 翻唱），会直接把音频发到当前会话。
 
         音频前会标明唱的是哪个版本；如果用户听完说不是这首，用 confirm_song
@@ -716,6 +778,8 @@ class DeepSeekSingPlugin(Star):
         Args:
             song(string): 歌曲名；用户明确确认过的 B 站歌曲链接也可以直接传。
             voice(string, optional): 音色名（用户在音色广场挑好的名字），可先调用 list_sing_voices 获取广场链接。
+            instrumental_volume(int, optional): 伴奏增益（dB）：0 带原始音量伴奏，负数更轻（最小 -60）；仅当用户明确要伴奏时传 0，没提就不传（默认纯人声）。
+            backup_vocals_volume(int, optional): 和声增益（dB）：0 带和声（和声也会被转成所选音色），负数更轻；仅当用户明确要和声时传。
         Returns:
             已受理提示；音频生成完成后会主动发送到当前会话。失败时以消息形式告知。
         '''
@@ -728,7 +792,12 @@ class DeepSeekSingPlugin(Star):
             return refusal
         # Return immediately: generation takes minutes and AstrBot caps tool calls
         # (tool_call_timeout, 60-120s by default). The audio is pushed when ready.
-        self._start_generation(event, song, (voice or "").strip())
+        self._start_generation(
+            event,
+            song,
+            (voice or "").strip(),
+            mix=self._mix_from_tool(instrumental_volume, backup_vocals_volume),
+        )
         return "已提交生成，完成后会直接把音频发到当前会话，请稍候。"
 
     @filter.llm_tool(name="confirm_song")
